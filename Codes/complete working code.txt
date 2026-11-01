@@ -1,0 +1,2108 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <DHT.h>
+
+#include <WiFi.h>
+#include <WebServer.h>
+
+// =====================================================
+// SMART PLANT WATERING SYSTEM
+// ESP32 + PREMIUM LOCAL WEB DASHBOARD
+//
+// Soil Moisture
+// Estimated Demo pH
+// DHT11 Temperature / Humidity
+// Water Tank Level
+// Automatic Pump Control
+// 16x2 LCD
+// Local Wi-Fi Dashboard
+// =====================================================
+
+
+// =====================================================
+// WIFI ACCESS POINT
+// =====================================================
+
+const char* AP_SSID     = "SmartWatering";
+const char* AP_PASSWORD = "plant1234";
+
+// Fixed dashboard IP
+IPAddress localIP(192, 168, 4, 1);
+IPAddress gateway(192, 168, 4, 1);
+IPAddress subnet(255, 255, 255, 0);
+
+WebServer server(80);
+
+bool dashboardConnected = false;
+
+
+// =====================================================
+// PIN DEFINITIONS
+// =====================================================
+
+#define DHTPIN 4
+#define DHTTYPE DHT11
+
+#define SOIL_PIN       34
+#define WATER_LEVEL_PIN 35
+#define RELAY_PIN      26
+
+
+// =====================================================
+// SOIL CALIBRATION
+// Actual tested values
+// =====================================================
+
+#define SOIL_DRY 4095
+#define SOIL_WET 1500
+
+
+// =====================================================
+// WATER LEVEL THRESHOLDS
+// =====================================================
+
+#define WATER_EMPTY  200
+#define WATER_LOW    1200
+#define WATER_MEDIUM 2000
+
+
+// =====================================================
+// AUTOMATIC WATERING
+// =====================================================
+
+#define PUMP_ON_THRESHOLD  35
+#define PUMP_OFF_THRESHOLD 55
+
+#define MAX_PUMP_RUNTIME 30000UL
+
+
+// =====================================================
+// OBJECTS
+// =====================================================
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+DHT dht(DHTPIN, DHTTYPE);
+
+
+// =====================================================
+// GLOBAL SENSOR VALUES
+// Used by both LCD and Web Dashboard
+// =====================================================
+
+int soilRaw = 4095;
+int moisture = 0;
+
+float estimatedPhValue = 6.4;
+
+float temperature = 0.0;
+float humidity = 0.0;
+
+bool dhtOK = false;
+
+int waterRaw = 0;
+
+String tankStatus = "EMPTY";
+
+bool pumpState = false;
+
+unsigned long pumpStartTime = 0;
+
+
+// =====================================================
+// TIMING
+// =====================================================
+
+unsigned long lastSensorRead = 0;
+unsigned long lastLCDChange = 0;
+
+const unsigned long SENSOR_INTERVAL = 2000;
+const unsigned long LCD_INTERVAL = 2000;
+
+int lcdPage = 0;
+
+bool lcdImmediateRefresh = false;
+
+
+// =====================================================
+// ESTIMATED DEMO pH
+// =====================================================
+
+float estimatedPH(int moisturePercent)
+{
+  if (moisturePercent <= 20)
+    return 6.4;
+
+  else if (moisturePercent <= 40)
+    return 6.5;
+
+  else if (moisturePercent <= 60)
+    return 6.7;
+
+  else if (moisturePercent <= 80)
+    return 6.8;
+
+  else
+    return 6.9;
+}
+
+
+// =====================================================
+// WATER LEVEL STATUS
+// =====================================================
+
+String getWaterLevel(int value)
+{
+  if (value < WATER_EMPTY)
+    return "EMPTY";
+
+  else if (value < WATER_LOW)
+    return "LOW";
+
+  else if (value < WATER_MEDIUM)
+    return "MEDIUM";
+
+  else
+    return "HIGH";
+}
+
+
+// =====================================================
+// AVERAGE SOIL SENSOR
+// =====================================================
+
+int readSoilSensor()
+{
+  long total = 0;
+
+  for (int i = 0; i < 10; i++)
+  {
+    total += analogRead(SOIL_PIN);
+    delay(5);
+  }
+
+  return total / 10;
+}
+
+
+// =====================================================
+// AVERAGE WATER SENSOR
+// =====================================================
+
+int readWaterSensor()
+{
+  long total = 0;
+
+  for (int i = 0; i < 10; i++)
+  {
+    total += analogRead(WATER_LEVEL_PIN);
+    delay(5);
+  }
+
+  return total / 10;
+}
+
+
+// =====================================================
+// PUMP CONTROL
+// ACTIVE LOW RELAY
+// =====================================================
+
+void setPump(bool state)
+{
+  // Detect OFF -> ON transition
+  if (state && !pumpState)
+  {
+    pumpStartTime = millis();
+  }
+
+  pumpState = state;
+
+  if (pumpState)
+  {
+    digitalWrite(RELAY_PIN, LOW);
+  }
+  else
+  {
+    digitalWrite(RELAY_PIN, HIGH);
+  }
+}
+
+
+// =====================================================
+// SENSOR READING + AUTOMATIC WATERING
+// =====================================================
+
+void updateSensors()
+{
+  // -------------------------------------
+  // SOIL MOISTURE
+  // -------------------------------------
+
+  soilRaw = readSoilSensor();
+
+  moisture = map(
+    soilRaw,
+    SOIL_DRY,
+    SOIL_WET,
+    0,
+    100
+  );
+
+  moisture = constrain(moisture, 0, 100);
+
+
+  // -------------------------------------
+  // ESTIMATED pH
+  // -------------------------------------
+
+  estimatedPhValue = estimatedPH(moisture);
+
+
+  // -------------------------------------
+  // DHT11
+  // -------------------------------------
+
+  float newTemperature = dht.readTemperature();
+  float newHumidity = dht.readHumidity();
+
+  if (!isnan(newTemperature) &&
+      !isnan(newHumidity))
+  {
+    temperature = newTemperature;
+    humidity = newHumidity;
+
+    dhtOK = true;
+  }
+  else
+  {
+    dhtOK = false;
+
+    Serial.println("WARNING: DHT11 reading failed");
+  }
+
+
+  // -------------------------------------
+  // WATER LEVEL
+  // -------------------------------------
+
+  waterRaw = readWaterSensor();
+
+  tankStatus = getWaterLevel(waterRaw);
+
+
+  // -------------------------------------
+  // AUTOMATIC PUMP CONTROL
+  // -------------------------------------
+
+  // No tank water
+  if (waterRaw < WATER_EMPTY)
+  {
+    setPump(false);
+  }
+
+  else
+  {
+    // Dry soil
+    if (moisture < PUMP_ON_THRESHOLD &&
+        !pumpState)
+    {
+      setPump(true);
+    }
+
+    // Soil sufficiently wet
+    else if (moisture >= PUMP_OFF_THRESHOLD)
+    {
+      setPump(false);
+    }
+  }
+
+
+  // -------------------------------------
+  // SERIAL MONITOR
+  // -------------------------------------
+
+  Serial.print("Soil Raw: ");
+  Serial.print(soilRaw);
+
+  Serial.print(" | Moisture: ");
+  Serial.print(moisture);
+  Serial.print("%");
+
+  Serial.print(" | pH(est): ");
+  Serial.print(estimatedPhValue, 1);
+
+  if (dhtOK)
+  {
+    Serial.print(" | Temp: ");
+    Serial.print(temperature, 1);
+    Serial.print("C");
+
+    Serial.print(" | Humidity: ");
+    Serial.print(humidity, 0);
+    Serial.print("%");
+  }
+  else
+  {
+    Serial.print(" | DHT: ERROR");
+  }
+
+  Serial.print(" | Water Raw: ");
+  Serial.print(waterRaw);
+
+  Serial.print(" | Tank: ");
+  Serial.print(tankStatus);
+
+  Serial.print(" | Pump: ");
+
+  if (pumpState)
+    Serial.println("ON");
+  else
+    Serial.println("OFF");
+}
+
+
+// =====================================================
+// LCD IP SCREEN
+// Shown until first dashboard connection
+// =====================================================
+
+void showDashboardIP()
+{
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("Open Dashboard");
+
+  lcd.setCursor(0, 1);
+  lcd.print(WiFi.softAPIP());
+}
+
+
+// =====================================================
+// NORMAL LCD PAGES
+// =====================================================
+
+void updateLCD()
+{
+  // Keep showing IP until browser opens dashboard
+  if (!dashboardConnected)
+  {
+    return;
+  }
+
+  if (!lcdImmediateRefresh &&
+      millis() - lastLCDChange < LCD_INTERVAL)
+  {
+    return;
+  }
+
+  lcdImmediateRefresh = false;
+
+  lastLCDChange = millis();
+
+  lcd.clear();
+
+
+  // ===================================================
+  // PAGE 1
+  // ===================================================
+
+  if (lcdPage == 0)
+  {
+    lcd.setCursor(0, 0);
+
+    lcd.print("Moist:");
+    lcd.print(moisture);
+    lcd.print("%");
+
+    lcd.setCursor(0, 1);
+
+    lcd.print("pH(est):");
+    lcd.print(estimatedPhValue, 1);
+  }
+
+
+  // ===================================================
+  // PAGE 2
+  // ===================================================
+
+  else if (lcdPage == 1)
+  {
+    if (dhtOK)
+    {
+      lcd.setCursor(0, 0);
+
+      lcd.print("Temp:");
+      lcd.print(temperature, 1);
+      lcd.print("C");
+
+      lcd.setCursor(0, 1);
+
+      lcd.print("Hum:");
+      lcd.print(humidity, 0);
+      lcd.print("%");
+    }
+
+    else
+    {
+      lcd.setCursor(0, 0);
+      lcd.print("DHT11 ERROR");
+
+      lcd.setCursor(0, 1);
+      lcd.print("Check Sensor");
+    }
+  }
+
+
+  // ===================================================
+  // PAGE 3
+  // ===================================================
+
+  else if (lcdPage == 2)
+  {
+    lcd.setCursor(0, 0);
+
+    lcd.print("Tank:");
+    lcd.print(tankStatus);
+
+    lcd.setCursor(0, 1);
+
+    lcd.print("Pump:");
+
+    if (pumpState)
+      lcd.print("ON");
+    else
+      lcd.print("OFF");
+  }
+
+
+  // ===================================================
+  // PAGE 4
+  // ===================================================
+
+  else
+  {
+    lcd.setCursor(0, 0);
+
+    if (moisture <= 20)
+      lcd.print("Soil:VERY DRY");
+
+    else if (moisture <= 40)
+      lcd.print("Soil:DRY");
+
+    else if (moisture <= 60)
+      lcd.print("Soil:NORMAL");
+
+    else if (moisture <= 80)
+      lcd.print("Soil:MOIST");
+
+    else
+      lcd.print("Soil:VERY WET");
+
+
+    lcd.setCursor(0, 1);
+
+    if (waterRaw < WATER_EMPTY)
+      lcd.print("NO WATER!");
+
+    else
+      lcd.print("Auto Mode");
+  }
+
+
+  lcdPage++;
+
+  if (lcdPage > 3)
+    lcdPage = 0;
+}
+
+
+// =====================================================
+// PREMIUM DASHBOARD HTML
+// =====================================================
+
+const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
+
+<!DOCTYPE html>
+
+<html lang="en">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta
+  name="viewport"
+  content="width=device-width, initial-scale=1.0">
+
+<title>Smart Watering Dashboard</title>
+
+<style>
+
+*{
+  box-sizing:border-box;
+  margin:0;
+  padding:0;
+}
+
+body{
+  font-family:
+    Inter,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
+
+  background:
+    radial-gradient(
+      circle at top left,
+      #123c35 0%,
+      #071714 35%,
+      #040b0a 100%
+    );
+
+  color:#edfdf8;
+
+  min-height:100vh;
+}
+
+.container{
+  width:min(1180px,92%);
+  margin:auto;
+  padding:35px 0 60px;
+}
+
+
+/* ===============================
+   HEADER
+   =============================== */
+
+.header{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  gap:20px;
+  margin-bottom:35px;
+}
+
+.brand-small{
+  color:#67e8c7;
+  font-size:12px;
+  font-weight:700;
+  letter-spacing:3px;
+  margin-bottom:8px;
+}
+
+h1{
+  font-size:clamp(28px,4vw,45px);
+  font-weight:700;
+  letter-spacing:-1.5px;
+}
+
+.subtitle{
+  margin-top:8px;
+  color:#88a79e;
+  font-size:14px;
+}
+
+.live{
+  display:flex;
+  align-items:center;
+  gap:8px;
+
+  padding:10px 15px;
+
+  border:1px solid rgba(98,255,206,.25);
+
+  background:rgba(30,90,75,.25);
+
+  border-radius:100px;
+
+  color:#70f3cb;
+
+  font-size:13px;
+  font-weight:700;
+}
+
+.dot{
+  width:8px;
+  height:8px;
+
+  background:#39e6b4;
+
+  border-radius:50%;
+
+  box-shadow:
+    0 0 10px #39e6b4;
+}
+
+
+/* ===============================
+   STATUS PANEL
+   =============================== */
+
+.statusPanel{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+
+  gap:20px;
+
+  margin-bottom:24px;
+
+  padding:22px;
+
+  border:
+    1px solid rgba(255,255,255,.07);
+
+  background:
+    rgba(255,255,255,.035);
+
+  backdrop-filter:blur(18px);
+
+  border-radius:22px;
+}
+
+.statusLabel{
+  color:#7fa49a;
+  font-size:12px;
+  text-transform:uppercase;
+  letter-spacing:2px;
+}
+
+#systemStatus{
+  margin-top:5px;
+  font-size:20px;
+  font-weight:650;
+}
+
+.autoBadge{
+  padding:9px 13px;
+
+  background:
+    rgba(45,212,191,.12);
+
+  border:
+    1px solid rgba(45,212,191,.22);
+
+  border-radius:10px;
+
+  color:#60e6cb;
+
+  font-size:12px;
+  font-weight:700;
+}
+
+
+/* ===============================
+   CARDS
+   =============================== */
+
+.grid{
+  display:grid;
+
+  grid-template-columns:
+    repeat(3,1fr);
+
+  gap:18px;
+}
+
+.card{
+  position:relative;
+
+  overflow:hidden;
+
+  min-height:185px;
+
+  padding:22px;
+
+  border-radius:22px;
+
+  background:
+    linear-gradient(
+      145deg,
+      rgba(255,255,255,.065),
+      rgba(255,255,255,.025)
+    );
+
+  border:
+    1px solid rgba(255,255,255,.075);
+
+  box-shadow:
+    0 18px 50px rgba(0,0,0,.22);
+}
+
+.card:before{
+  content:"";
+
+  position:absolute;
+
+  width:100px;
+  height:100px;
+
+  right:-40px;
+  top:-40px;
+
+  border-radius:50%;
+
+  background:
+    rgba(53,225,181,.08);
+
+  filter:blur(10px);
+}
+
+.label{
+  color:#7fa49a;
+
+  font-size:12px;
+
+  letter-spacing:1.4px;
+
+  text-transform:uppercase;
+}
+
+.value{
+  margin-top:18px;
+
+  font-size:42px;
+
+  font-weight:700;
+
+  letter-spacing:-1.5px;
+}
+
+.unit{
+  color:#6e948a;
+
+  font-size:16px;
+
+  margin-left:4px;
+}
+
+.description{
+  margin-top:8px;
+
+  color:#7d978f;
+
+  font-size:12px;
+
+  line-height:1.5;
+}
+
+
+/* ===============================
+   PROGRESS BAR
+   =============================== */
+
+.progress{
+  margin-top:18px;
+
+  height:7px;
+
+  background:#102520;
+
+  border-radius:20px;
+
+  overflow:hidden;
+}
+
+.progressFill{
+  height:100%;
+
+  width:0%;
+
+  background:
+    linear-gradient(
+      90deg,
+      #20b894,
+      #55f3ca
+    );
+
+  transition:
+    width .5s ease;
+
+  border-radius:20px;
+}
+
+
+/* ===============================
+   LOWER SECTION
+   =============================== */
+
+.bottomGrid{
+  margin-top:18px;
+
+  display:grid;
+
+  grid-template-columns:
+    2fr 1fr;
+
+  gap:18px;
+}
+
+.panel{
+  padding:22px;
+
+  border-radius:22px;
+
+  background:
+    rgba(255,255,255,.035);
+
+  border:
+    1px solid rgba(255,255,255,.07);
+}
+
+.panelTitle{
+  font-size:15px;
+  font-weight:650;
+  margin-bottom:18px;
+}
+
+canvas{
+  width:100%;
+  height:190px;
+}
+
+.infoRow{
+  display:flex;
+
+  justify-content:space-between;
+
+  padding:14px 0;
+
+  border-bottom:
+    1px solid rgba(255,255,255,.05);
+
+  color:#91aaa3;
+
+  font-size:13px;
+}
+
+.infoRow:last-child{
+  border-bottom:none;
+}
+
+.infoValue{
+  color:#edfdf8;
+  font-weight:600;
+}
+
+
+/* ===============================
+   PUMP INDICATOR
+   =============================== */
+
+.pumpON{
+  color:#65f4cb;
+}
+
+.pumpOFF{
+  color:#8da49e;
+}
+
+
+/* ===============================
+   FOOTER
+   =============================== */
+
+.footer{
+  margin-top:28px;
+
+  text-align:center;
+
+  color:#48675f;
+
+  font-size:11px;
+
+  letter-spacing:1px;
+}
+
+
+/* ===============================
+   RESPONSIVE
+   =============================== */
+
+@media(max-width:850px){
+
+  .grid{
+    grid-template-columns:
+      repeat(2,1fr);
+  }
+
+  .bottomGrid{
+    grid-template-columns:1fr;
+  }
+
+}
+
+@media(max-width:560px){
+
+  .header{
+    align-items:flex-start;
+    flex-direction:column;
+  }
+
+  .grid{
+    grid-template-columns:1fr;
+  }
+
+  .statusPanel{
+    align-items:flex-start;
+    flex-direction:column;
+  }
+
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="container">
+
+
+  <!-- HEADER -->
+
+  <div class="header">
+
+    <div>
+
+      <div class="brand-small">
+        SMART AGRICULTURE // LIVE
+      </div>
+
+      <h1>
+        Plant Watering
+      </h1>
+
+      <div class="subtitle">
+        Intelligent environmental monitoring & automatic irrigation
+      </div>
+
+    </div>
+
+    <div class="live">
+
+      <div class="dot"></div>
+
+      LIVE SYSTEM
+
+    </div>
+
+  </div>
+
+
+  <!-- SYSTEM STATUS -->
+
+  <div class="statusPanel">
+
+    <div>
+
+      <div class="statusLabel">
+        System status
+      </div>
+
+      <div id="systemStatus">
+        Connecting to ESP32...
+      </div>
+
+    </div>
+
+    <div class="autoBadge">
+      AUTO IRRIGATION ENABLED
+    </div>
+
+  </div>
+
+
+  <!-- SENSOR CARDS -->
+
+  <div class="grid">
+
+
+    <!-- MOISTURE -->
+
+    <div class="card">
+
+      <div class="label">
+        Soil Moisture
+      </div>
+
+      <div class="value">
+
+        <span id="moisture">
+          --
+        </span>
+
+        <span class="unit">
+          %
+        </span>
+
+      </div>
+
+      <div
+        id="soilCondition"
+        class="description">
+
+        Waiting for sensor...
+
+      </div>
+
+      <div class="progress">
+
+        <div
+          id="moistureBar"
+          class="progressFill">
+        </div>
+
+      </div>
+
+    </div>
+
+
+    <!-- pH -->
+
+    <div class="card">
+
+      <div class="label">
+        Estimated pH
+      </div>
+
+      <div class="value">
+
+        <span id="ph">
+          --
+        </span>
+
+      </div>
+
+      <div class="description">
+        Prototype estimate derived from moisture range
+      </div>
+
+    </div>
+
+
+    <!-- TEMPERATURE -->
+
+    <div class="card">
+
+      <div class="label">
+        Temperature
+      </div>
+
+      <div class="value">
+
+        <span id="temperature">
+          --
+        </span>
+
+        <span class="unit">
+          °C
+        </span>
+
+      </div>
+
+      <div class="description">
+        Ambient temperature from DHT11
+      </div>
+
+    </div>
+
+
+    <!-- HUMIDITY -->
+
+    <div class="card">
+
+      <div class="label">
+        Humidity
+      </div>
+
+      <div class="value">
+
+        <span id="humidity">
+          --
+        </span>
+
+        <span class="unit">
+          %
+        </span>
+
+      </div>
+
+      <div class="description">
+        Ambient relative humidity
+      </div>
+
+    </div>
+
+
+    <!-- WATER TANK -->
+
+    <div class="card">
+
+      <div class="label">
+        Water Reservoir
+      </div>
+
+      <div
+        id="tank"
+        class="value">
+
+        --
+
+      </div>
+
+      <div class="description">
+        Irrigation water availability
+      </div>
+
+      <div class="progress">
+
+        <div
+          id="tankBar"
+          class="progressFill">
+        </div>
+
+      </div>
+
+    </div>
+
+
+    <!-- PUMP -->
+
+    <div class="card">
+
+      <div class="label">
+        Irrigation Pump
+      </div>
+
+      <div
+        id="pump"
+        class="value pumpOFF">
+
+        OFF
+
+      </div>
+
+      <div
+        id="pumpDescription"
+        class="description">
+
+        Automatic control ready
+
+      </div>
+
+    </div>
+
+
+  </div>
+
+
+  <!-- LOWER SECTION -->
+
+  <div class="bottomGrid">
+
+
+    <!-- CHART -->
+
+    <div class="panel">
+
+      <div class="panelTitle">
+        Live Soil Moisture Trend
+      </div>
+
+      <canvas id="chart"></canvas>
+
+    </div>
+
+
+    <!-- SYSTEM INFO -->
+
+    <div class="panel">
+
+      <div class="panelTitle">
+        System Information
+      </div>
+
+
+      <div class="infoRow">
+
+        <span>
+          Control Mode
+        </span>
+
+        <span class="infoValue">
+          Automatic
+        </span>
+
+      </div>
+
+
+      <div class="infoRow">
+
+        <span>
+          Pump ON
+        </span>
+
+        <span class="infoValue">
+          &lt; 35%
+        </span>
+
+      </div>
+
+
+      <div class="infoRow">
+
+        <span>
+          Pump OFF
+        </span>
+
+        <span class="infoValue">
+          ≥ 55%
+        </span>
+
+      </div>
+
+
+      <div class="infoRow">
+
+        <span>
+          ESP32 IP
+        </span>
+
+        <span
+          id="ip"
+          class="infoValue">
+
+          192.168.4.1
+
+        </span>
+
+      </div>
+
+
+      <div class="infoRow">
+
+        <span>
+          Uptime
+        </span>
+
+        <span
+          id="uptime"
+          class="infoValue">
+
+          --
+
+        </span>
+
+      </div>
+
+
+    </div>
+
+
+  </div>
+
+
+  <div class="footer">
+
+    SMART PLANT WATERING SYSTEM • ESP32 LOCAL CONTROL
+
+  </div>
+
+
+</div>
+
+
+<script>
+
+let moistureHistory = [];
+
+
+/* ==========================================
+   UPDATE DASHBOARD
+   ========================================== */
+
+async function updateDashboard(){
+
+  try{
+
+    const response =
+      await fetch(
+        "/api/data",
+        {
+          cache:"no-store"
+        }
+      );
+
+    const data =
+      await response.json();
+
+
+    /* MOISTURE */
+
+    document.getElementById(
+      "moisture"
+    ).textContent =
+      data.moisture;
+
+    document.getElementById(
+      "moistureBar"
+    ).style.width =
+      data.moisture + "%";
+
+
+    /* SOIL CONDITION */
+
+    let condition = "";
+
+    if(data.moisture <= 20)
+      condition = "Very dry soil";
+
+    else if(data.moisture <= 40)
+      condition = "Dry soil";
+
+    else if(data.moisture <= 60)
+      condition = "Normal moisture";
+
+    else if(data.moisture <= 80)
+      condition = "Moist soil";
+
+    else
+      condition = "Very wet soil";
+
+
+    document.getElementById(
+      "soilCondition"
+    ).textContent =
+      condition;
+
+
+    /* pH */
+
+    document.getElementById(
+      "ph"
+    ).textContent =
+      Number(data.ph).toFixed(1);
+
+
+    /* DHT */
+
+    if(data.dhtOK){
+
+      document.getElementById(
+        "temperature"
+      ).textContent =
+        Number(data.temperature).toFixed(1);
+
+      document.getElementById(
+        "humidity"
+      ).textContent =
+        Math.round(data.humidity);
+
+    }
+
+    else{
+
+      document.getElementById(
+        "temperature"
+      ).textContent =
+        "ERR";
+
+      document.getElementById(
+        "humidity"
+      ).textContent =
+        "ERR";
+
+    }
+
+
+    /* TANK */
+
+    document.getElementById(
+      "tank"
+    ).textContent =
+      data.tank;
+
+
+    let tankPercent = 0;
+
+    if(data.tank === "LOW")
+      tankPercent = 30;
+
+    else if(data.tank === "MEDIUM")
+      tankPercent = 65;
+
+    else if(data.tank === "HIGH")
+      tankPercent = 100;
+
+
+    document.getElementById(
+      "tankBar"
+    ).style.width =
+      tankPercent + "%";
+
+
+    /* PUMP */
+
+    const pumpElement =
+      document.getElementById(
+        "pump"
+      );
+
+
+    if(data.pump){
+
+      pumpElement.textContent =
+        "ON";
+
+      pumpElement.className =
+        "value pumpON";
+
+      document.getElementById(
+        "pumpDescription"
+      ).textContent =
+        "Watering plant now";
+
+    }
+
+    else{
+
+      pumpElement.textContent =
+        "OFF";
+
+      pumpElement.className =
+        "value pumpOFF";
+
+      document.getElementById(
+        "pumpDescription"
+      ).textContent =
+        "Automatic control ready";
+
+    }
+
+
+    /* SYSTEM STATUS */
+
+    let status = "";
+
+    if(data.tank === "EMPTY"){
+
+      status =
+        "Water tank empty — pump protected";
+
+    }
+
+    else if(data.pump){
+
+      status =
+        "Irrigation active";
+
+    }
+
+    else if(data.moisture < 35){
+
+      status =
+        "Dry soil detected";
+
+    }
+
+    else{
+
+      status =
+        "System healthy";
+
+    }
+
+
+    document.getElementById(
+      "systemStatus"
+    ).textContent =
+      status;
+
+
+    /* SYSTEM INFO */
+
+    document.getElementById(
+      "ip"
+    ).textContent =
+      data.ip;
+
+
+    const minutes =
+      Math.floor(
+        data.uptime / 60
+      );
+
+    const seconds =
+      data.uptime % 60;
+
+
+    document.getElementById(
+      "uptime"
+    ).textContent =
+      minutes + "m " +
+      seconds + "s";
+
+
+    /* HISTORY */
+
+    moistureHistory.push(
+      data.moisture
+    );
+
+    if(moistureHistory.length > 40)
+      moistureHistory.shift();
+
+
+    drawChart();
+
+  }
+
+  catch(error){
+
+    document.getElementById(
+      "systemStatus"
+    ).textContent =
+      "ESP32 connection lost";
+
+  }
+
+}
+
+
+/* ==========================================
+   SIMPLE LIVE GRAPH
+   ========================================== */
+
+function drawChart(){
+
+  const canvas =
+    document.getElementById(
+      "chart"
+    );
+
+  const rect =
+    canvas.getBoundingClientRect();
+
+  const dpr =
+    window.devicePixelRatio || 1;
+
+
+  canvas.width =
+    rect.width * dpr;
+
+  canvas.height =
+    rect.height * dpr;
+
+
+  const ctx =
+    canvas.getContext("2d");
+
+  ctx.scale(
+    dpr,
+    dpr
+  );
+
+
+  const w =
+    rect.width;
+
+  const h =
+    rect.height;
+
+
+  ctx.clearRect(
+    0,
+    0,
+    w,
+    h
+  );
+
+
+  /* GRID */
+
+  ctx.strokeStyle =
+    "rgba(255,255,255,.06)";
+
+  ctx.lineWidth = 1;
+
+
+  for(let i=0;i<=4;i++){
+
+    const y =
+      (h / 4) * i;
+
+    ctx.beginPath();
+
+    ctx.moveTo(
+      0,
+      y
+    );
+
+    ctx.lineTo(
+      w,
+      y
+    );
+
+    ctx.stroke();
+
+  }
+
+
+  if(moistureHistory.length < 2)
+    return;
+
+
+  /* LINE */
+
+  ctx.strokeStyle =
+    "#4de4bd";
+
+  ctx.lineWidth = 2.5;
+
+  ctx.beginPath();
+
+
+  moistureHistory.forEach(
+    (value,index)=>{
+
+      const x =
+        index /
+        (moistureHistory.length - 1)
+        * w;
+
+      const y =
+        h -
+        (value / 100 * h);
+
+
+      if(index === 0)
+        ctx.moveTo(x,y);
+
+      else
+        ctx.lineTo(x,y);
+
+    }
+  );
+
+
+  ctx.stroke();
+
+
+  /* GLOW */
+
+  ctx.shadowColor =
+    "#4de4bd";
+
+  ctx.shadowBlur = 8;
+
+}
+
+
+/* ==========================================
+   RUN
+   ========================================== */
+
+updateDashboard();
+
+setInterval(
+  updateDashboard,
+  1500
+);
+
+window.addEventListener(
+  "resize",
+  drawChart
+);
+
+</script>
+
+</body>
+
+</html>
+
+)rawliteral";
+
+
+// =====================================================
+// ROOT DASHBOARD
+// =====================================================
+
+void handleRoot()
+{
+  // First successful browser connection
+  if (!dashboardConnected)
+  {
+    dashboardConnected = true;
+
+    lcdPage = 0;
+
+    lcdImmediateRefresh = true;
+
+    Serial.println(
+      "Dashboard connected - LCD normal display enabled"
+    );
+  }
+
+  server.send_P(
+    200,
+    "text/html",
+    DASHBOARD_HTML
+  );
+}
+
+
+// =====================================================
+// JSON LIVE DATA API
+// =====================================================
+
+void handleData()
+{
+  String json;
+
+  json.reserve(500);
+
+  json += "{";
+
+  json += "\"moisture\":";
+  json += String(moisture);
+  json += ",";
+
+  json += "\"soilRaw\":";
+  json += String(soilRaw);
+  json += ",";
+
+  json += "\"ph\":";
+  json += String(estimatedPhValue, 1);
+  json += ",";
+
+  json += "\"dhtOK\":";
+  json += dhtOK ? "true" : "false";
+  json += ",";
+
+  json += "\"temperature\":";
+
+  if (dhtOK)
+    json += String(temperature, 1);
+  else
+    json += "null";
+
+  json += ",";
+
+  json += "\"humidity\":";
+
+  if (dhtOK)
+    json += String(humidity, 0);
+  else
+    json += "null";
+
+  json += ",";
+
+  json += "\"waterRaw\":";
+  json += String(waterRaw);
+  json += ",";
+
+  json += "\"tank\":\"";
+  json += tankStatus;
+  json += "\",";
+
+  json += "\"pump\":";
+  json += pumpState ? "true" : "false";
+  json += ",";
+
+  json += "\"ip\":\"";
+  json += WiFi.softAPIP().toString();
+  json += "\",";
+
+  json += "\"uptime\":";
+  json += String(millis() / 1000);
+
+  json += "}";
+
+
+  server.sendHeader(
+    "Cache-Control",
+    "no-store"
+  );
+
+  server.send(
+    200,
+    "application/json",
+    json
+  );
+}
+
+
+// =====================================================
+// SETUP WEB SERVER
+// =====================================================
+
+void setupWebServer()
+{
+  server.on(
+    "/",
+    HTTP_GET,
+    handleRoot
+  );
+
+
+  server.on(
+    "/api/data",
+    HTTP_GET,
+    handleData
+  );
+
+
+  server.on(
+    "/favicon.ico",
+    HTTP_GET,
+    []()
+    {
+      server.send(
+        204,
+        "text/plain",
+        ""
+      );
+    }
+  );
+
+
+  server.onNotFound(
+    []()
+    {
+      server.send(
+        404,
+        "text/plain",
+        "404 - Page Not Found"
+      );
+    }
+  );
+
+
+  server.begin();
+
+  Serial.println(
+    "HTTP server started"
+  );
+}
+
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup()
+{
+  Serial.begin(115200);
+
+
+  // ===================================================
+  // LCD
+  // ===================================================
+
+  Wire.begin(21, 22);
+
+  lcd.init();
+
+  lcd.backlight();
+
+
+  // ===================================================
+  // DHT
+  // ===================================================
+
+  dht.begin();
+
+
+  // ===================================================
+  // RELAY
+  // ===================================================
+
+  pinMode(
+    RELAY_PIN,
+    OUTPUT
+  );
+
+  setPump(false);
+
+
+  // ===================================================
+  // START SCREEN
+  // ===================================================
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+
+  lcd.print(
+    "Smart Watering"
+  );
+
+  lcd.setCursor(0, 1);
+
+  lcd.print(
+    "Starting WiFi..."
+  );
+
+  delay(1500);
+
+
+  // ===================================================
+  // START ESP32 ACCESS POINT
+  // ===================================================
+
+  WiFi.mode(
+    WIFI_AP
+  );
+
+
+  WiFi.softAPConfig(
+    localIP,
+    gateway,
+    subnet
+  );
+
+
+  bool apStarted =
+    WiFi.softAP(
+      AP_SSID,
+      AP_PASSWORD
+    );
+
+
+  if (!apStarted)
+  {
+    lcd.clear();
+
+    lcd.setCursor(0, 0);
+
+    lcd.print(
+      "WiFi AP ERROR"
+    );
+
+    Serial.println(
+      "Failed to start WiFi Access Point"
+    );
+  }
+
+  else
+  {
+    Serial.println();
+
+    Serial.println(
+      "================================="
+    );
+
+    Serial.println(
+      "SMART WATERING DASHBOARD"
+    );
+
+    Serial.println(
+      "================================="
+    );
+
+    Serial.print(
+      "WiFi: "
+    );
+
+    Serial.println(
+      AP_SSID
+    );
+
+    Serial.print(
+      "Password: "
+    );
+
+    Serial.println(
+      AP_PASSWORD
+    );
+
+    Serial.print(
+      "Dashboard: http://"
+    );
+
+    Serial.println(
+      WiFi.softAPIP()
+    );
+
+    Serial.println(
+      "================================="
+    );
+
+
+    // Show IP until browser connects
+    showDashboardIP();
+  }
+
+
+  // ===================================================
+  // WEB SERVER
+  // ===================================================
+
+  setupWebServer();
+
+
+  // Make first sensor update immediate
+  lastSensorRead =
+    millis() - SENSOR_INTERVAL;
+}
+
+
+// =====================================================
+// MAIN LOOP
+// =====================================================
+
+void loop()
+{
+  // Keep web server responsive
+  server.handleClient();
+
+
+  // ===================================================
+  // SENSOR UPDATE
+  // ===================================================
+
+  if (
+    millis() - lastSensorRead
+    >= SENSOR_INTERVAL
+  )
+  {
+    lastSensorRead =
+      millis();
+
+    updateSensors();
+  }
+
+
+  // ===================================================
+  // PUMP SAFETY
+  // ===================================================
+
+  if (pumpState)
+  {
+    if (
+      millis() - pumpStartTime
+      >= MAX_PUMP_RUNTIME
+    )
+    {
+      setPump(false);
+
+      Serial.println(
+        "SAFETY: Pump maximum runtime reached"
+      );
+    }
+  }
+
+
+  // ===================================================
+  // LCD
+  // ===================================================
+
+  updateLCD();
+
+
+  delay(2);
+}
